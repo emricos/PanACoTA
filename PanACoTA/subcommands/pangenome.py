@@ -55,13 +55,13 @@ def main_from_parse(args):
         result of argparse parsing of all arguments in command line
     """
     cmd = "PanACoTA " + ' '.join(args.argv)
-    main(cmd, args.lstinfo_file, args.dataset_name, args.dbpath, args.min_id, args.outdir,
-         args.clust_mode, args.spedir, args.threads, args.outfile, args.verbose,
-         args.quiet)
+    main(cmd, args.lstinfo_file, args.dataset_name, args.dbpath, args.method, args.min_id, args.outdir,
+         args.clust_mode, args.po_mode, args.evalue, args.conn, args.purity, args.minspec, args.spedir,
+         args.threads, args.outfile, args.verbose, args.quiet)
 
 
-def main(cmd, lstinfo, name, dbpath, min_id, outdir, clust_mode, spe_dir, threads, outfile=None,
-         verbose=0, quiet=False):
+def main(cmd, lstinfo, name, dbpath, method, min_id, outdir, clust_mode, po_mode, evalue, conn, purity, minspec,
+         spe_dir, threads, outfile=None, verbose=0, quiet=False):
     """
     Main method, doing all steps:
 
@@ -81,12 +81,16 @@ def main(cmd, lstinfo, name, dbpath, min_id, outdir, clust_mode, spe_dir, thread
     dbpath : str
         path to the folder containing all protein files (files called as the name of genome
         given in lstinfo + ".prt"
+    method : str
+        Method to construct the pangenome
     min_id : float
         Minimum percentage of identity between 2 proteins to put them in the same family
     outdir : str
         path to folder which will contain pangenome results and tmp files
     clust_mode : [0, 1, 2]
         0 for 'set cover', 1 for 'single-linkage', 2 for 'CD-Hit'
+    po_mode : {blastp+|blastn+|tblastx+|diamond|usearch|ublast|lastp|lastn|rapsearch|topaz|blatp|blatn|mmseqsp|mmseqsn}
+        blast algorithm which is run on first steps of proteinortho
     spe_dir : str or None
         path to the folder where concatenated bank of proteins must be saved.
         None to use the same folder as protein files
@@ -107,16 +111,17 @@ def main(cmd, lstinfo, name, dbpath, min_id, outdir, clust_mode, spe_dir, thread
     import logging
     from PanACoTA import utils
     from PanACoTA.pangenome_module import protein_seq_functions as protf
-    from PanACoTA.pangenome_module import mmseqs_functions as mmf
     from PanACoTA.pangenome_module import post_treatment as pt
     from PanACoTA import __version__ as version
 
-    # test if mmseqs is installed and in the path
-    if not utils.check_installed("mmseqs"):  # pragma: no cover
-        print("mmseqs is not installed. 'PanACoTA pangenome' cannot run.")
+    from PanACoTA.pangenome_module.MMseq import MMseq
+    from PanACoTA.pangenome_module.ProteinOrtho import ProteinOrtho
+
+    # check if method is valid
+    if method not in ["mmseqs", "proteinortho"]:
+        print("unknown method. 'PanACoTA pangenome' cannot run.")
         sys.exit(1)
 
-    os.makedirs(outdir, exist_ok=True)
     # level is the minimum level that will be considered.
     # for verbose = 0 or 1, ignore details and debug, start from info
     if verbose <= 1:
@@ -134,11 +139,25 @@ def main(cmd, lstinfo, name, dbpath, min_id, outdir, clust_mode, spe_dir, thread
     logger.info(f'PanACoTA version {version}')
     logger.info("Command used\n \t > " + cmd)
 
-    # Build bank with all proteins to include in the pangenome
-    prt_path = protf.build_prt_bank(lstinfo, dbpath, name, spe_dir, quiet)
+
     # Do pangenome
-    families, panfile = mmf.run_all_pangenome(min_id, clust_mode, outdir,
-                                              prt_path, threads, outfile, quiet)
+    if method == "mmseqs":
+        # Build bank with all proteins to include in the pangenome
+        prt_path = protf.build_prt_bank(lstinfo, dbpath, name, spe_dir, quiet)
+        runner = MMseq(min_id, clust_mode, outdir, prt_path, threads, outfile, quiet)
+
+    if method == "proteinortho":
+        prt_path = protf.build_prt_bank(lstinfo, dbpath, name, spe_dir, quiet, dir=True)
+        runner = ProteinOrtho(po_mode, evalue, conn, purity, minspec, name, outdir, prt_path, threads, outfile, quiet)
+
+    # test if package required for pangenome building is installed and in the path
+    if not runner.check_installed():  # pragma: no cover
+        logger.error(f"{method} is not installed. 'PanACoTA pangenome' cannot run.")
+        sys.exit(1)
+
+    os.makedirs(outdir, exist_ok=True)
+    families, panfile = runner.run()
+
     # Create matrix pan_quali, pan_quanti and summary file
     pt.post_treat(families, panfile)
     logger.info("DONE")
@@ -179,6 +198,8 @@ def build_parser(parser):
     required.add_argument("-o", dest="outdir", required=True,
                           help=("Output directory, where all results must be saved "
                                 "(including tmp folder)"))
+    required.add_argument("-m", dest="method", choices=["mmseqs", "proteinortho"], required=True,
+                          help=("Method to construct pangenome."))
 
     optional = parser.add_argument_group('Optional arguments')
     optional.add_argument("-i", dest="min_id", type=utils_argparse.perc_id, default=0.8,
@@ -193,6 +214,25 @@ def build_parser(parser):
                           help=("Choose the clustering mode: 0 for 'set cover', 1 for "
                                 "'single-linkage', 2 for 'CD-Hit'. Default "
                                 "is 'single-linkage' (1)"))
+    optional.add_argument("-p", dest="po_mode", choices="blastp+ blastn+ tblastx+ diamond usearch ublast lastp "
+                                                        "lastn rapsearch topaz blatp blatn mmseqsp mmseqsn".split(),
+                          default="diamond",
+                          help=("For proteinortho algorithm. A blast algorithm which is used on initial steps."))
+    optional.add_argument("--eval", dest="evalue", default=1e-5,
+                          help=("Proteinortho search option. Evalue threshold for search algorithm."))
+    optional.add_argument("--conn", dest="conn", default=0.1,
+                          help=("Proteinortho clustering option. "
+                                "Minimal required algebraic connectivity for each connected "
+                                "component/group. This is the main parameter for the clustering algorithm. "
+                                "The higher this value, the more splits are made"))
+    optional.add_argument("--purity", dest="purity", default=1e-7,
+                          help=("Proteinortho clustering option. Avoid spurious graph assignments, "
+                                "the higher the more uncertain edges are cut"))
+    optional.add_argument("--minspecies", dest="minspec", default=1,
+                          help=("Proteinortho clustering option. "
+                                "minimal number of genes per species for each group. If a group is found "
+                                "with up to (minspecies) genes/species, it wont be split again "
+                                "(regardless of the connectivity). A value of 0 is always satisfied"))
     optional.add_argument("-s", dest="spedir",
                           help=("use this option if you want to save the concatenated protein "
                                 "databank in another directory than the one containing all "
@@ -202,6 +242,7 @@ def build_parser(parser):
                                 "Indicate on how many threads you want to parallelize. "
                                 "By default, it uses 1 thread. Put 0 if you want to use "
                                 "all threads of your computer."))
+    # TODO : добавить параметры поиска
 
     helper = parser.add_argument_group('Others')
     helper.add_argument("-v", "--verbose", dest="verbose", action="count", default=0,
